@@ -1,271 +1,164 @@
-"""The Vaillant Plus climate platform."""
+|CODE_EDIT_BLOCK|c:/Users/zhen/OneDrive/桌面/vaillant/custom_components/vaillant_plus/climate.py
+"""Support for climate."""
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from homeassistant.components.climate import ClimateEntity
+from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
 from homeassistant.components.climate.const import (
-    PRESET_COMFORT,
-    ClimateEntityFeature,
-    HVACAction,
     HVACMode,
+    PRESET_COMFORT,
+    PRESET_ECO,
+    PRESET_NONE,
+    ClimateEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .client import VaillantClient
-from .const import CONF_DID, DISPATCHERS, DOMAIN, EVT_DEVICE_CONNECTED, API_CLIENT
-from .entity import VaillantEntity
+from .const import (
+    CONF_DURATION_CONTROL,
+    DEFAULT_NAME,
+    DEFAULT_PORT,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+)
+from .entity import VaillantCoordinator, VaillantEntity
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_TEMPERATURE_INCREASE = 0.5
+SUPPORT_FLAGS = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
+HVAC_MODES = [HVACMode.HEAT, HVACMode.OFF]
+PRESET_MODES = [PRESET_COMFORT, PRESET_ECO, PRESET_NONE]
 
-PRESET_SUMMER = "Summer"
-PRESET_WINTER = "Winter"
+async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up the Vaillant climate."""
+    coordinator: VaillantCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-SUPPORTED_FEATURES = (
-    ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.TURN_OFF
-)
-SUPPORTED_HVAC_MODES = [HVACMode.HEAT, HVACMode.OFF]
-SUPPORTED_PRESET_MODES = [PRESET_COMFORT]
-
-
-async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_devices: AddEntitiesCallback
-) -> bool:
-    """Set up Vaillant devices from a config entry."""
-
-    device_id = entry.data.get(CONF_DID)
-    client: VaillantClient = hass.data[DOMAIN][API_CLIENT][
-        entry.entry_id
-    ]
-
-    added_entities = []
-
-    @callback
-    def async_new_climate(device_attrs: dict[str, Any]):
-        _LOGGER.debug("New climate found device_attrs == %s",device_attrs)
-
-        if "climate" not in added_entities:
-            if device_attrs.get("Heating_Enable") is not None:
-                new_devices = [VaillantClimate(client)]
-                async_add_devices(new_devices)
-                added_entities.append("climate")
-            else:
-                _LOGGER.warning(
-                    "Missing required attribute to setup Vaillant Climate. skip."
-                )
-        else:
-            _LOGGER.debug("Already added climate device. skip.")
-
-    unsub = async_dispatcher_connect(
-        hass, EVT_DEVICE_CONNECTED.format(device_id), async_new_climate
-    )
-
-    hass.data[DOMAIN][DISPATCHERS][device_id].append(unsub)
-
-    return True
-
+    entities = [VaillantClimate(coordinator, entry.data[CONF_DURATION_CONTROL])]
+    async_add_entities(entities, True)
 
 class VaillantClimate(VaillantEntity, ClimateEntity):
-    """Vaillant vSMART Climate."""
-    
-    def __init__(self, client):
-        self._client = client  # 保存 client 参数
-        self._cache = {}  # 初始化缓存字典
+    """Vaillant Climate."""
 
     @property
-    def should_poll(self) -> bool:
-        return False
+    def supported_features(self):
+        """Return the list of supported features."""
+        return SUPPORT_FLAGS
 
     @property
-    def unique_id(self) -> str:
-        """Return a unique ID to use for this entity."""
-
-        return f"{self.device.id}_climate"
-
-    @property
-    def name(self) -> str | None:
+    def name(self):
         """Return the name of the climate."""
+        return f"{DEFAULT_NAME} Climate"
+
+    @property
+    def unique_id(self):
+        """Return a unique identifier for the climate."""
+        return f"{self.coordinator.system_id}_climate_{self._hc_id}"
+
+    @property
+    def _hc_id(self):
+        """Return the heating circuit ID."""
+        return self.system.system_status.hc_status.hc_id
+
+    @property
+    def hvac_modes(self):
+        """Return the list of available hvac operation modes."""
+        return HVAC_MODES
+
+    @property
+    def hvac_mode(self):
+        """Return hvac operation ie. heat, cool mode."""
+        if not self.system.system_status.hc_status.is_heating_allowed:
+            return HVACMode.OFF
+        return HVACMode.HEAT
+
+    @property
+    def preset_modes(self):
+        """Return the list of available preset modes."""
+        return PRESET_MODES
+
+    @property
+    def preset_mode(self):
+        """Return the current preset mode."""
+        if self.system.system_status.hc_status.mode == "eco":
+            return PRESET_ECO
+        elif self.system.system_status.hc_status.mode == "comfort":
+            return PRESET_COMFORT
+        return PRESET_NONE
+
+    @property
+    def current_temperature(self):
+        """Return the current temperature."""
+        if self.system.system_status.hc_status.room_temperature is not None:
+            return self.system.system_status.hc_status.room_temperature
         return None
 
     @property
-    def supported_features(self) -> int:
-        """Return the flag of supported features for the climate."""
-        return SUPPORTED_FEATURES
+    def target_temperature(self):
+        """Return the temperature we try to reach."""
+        if self.system.system_status.hc_status.room_setpoint is not None:
+            return self.system.system_status.hc_status.room_setpoint
+        return None
 
     @property
-    def temperature_unit(self) -> str:
-        """Return the measurement unit for all temperature values."""
+    def hvac_action(self):
+        """Return the current running hvac operation."""
+        if self.system.system_status.hc_status.is_burning:
+            return "heating"
+        return "idle"
 
+    @property
+    def min_temp(self):
+        """Return the minimum temperature."""
+        return 5
+
+    @property
+    def max_temp(self):
+        """Return the maximum temperature."""
+        return 40
+
+    @property
+    def temperature_unit(self):
+        """Return the unit of measurement."""
         return UnitOfTemperature.CELSIUS
 
-    @property
-    def current_temperature(self) -> float:
-        """Return the current room temperature."""
-        return self._get_cached_value("Flow_Temperature_Setpoint", default=35.0)
+    async def async_set_temperature(self, **kwargs):
+        """Set new target temperature."""
+        temperature = kwargs.get(ATTR_TEMPERATURE)
+        if temperature is not None:
+            await self.coordinator.api.set_room_temperature(
+                self.system.system_status.device_id,
+                self.coordinator.system_id,
+                self._hc_id,
+                temperature,
+            )
+            self.coordinator.set_room_temperature(self._hc_id, temperature)
+            await self.coordinator.async_request_refresh()
 
-    @property
-    def target_temperature(self) -> float:
-        """Return the targeted room temperature."""
-        return self._get_cached_value("Flow_Temperature_Setpoint", default=35.0)
+    async def async_set_hvac_mode(self, hvac_mode):
+        """Set new target hvac mode."""
+        if hvac_mode == HVACMode.OFF:
+            await self.coordinator.api.set_heating_circuit_device_status(
+                self.system.system_status.device_id,
+                self.coordinator.system_id,
+                self._hc_id,
+                False,
+            )
+        else:
+            await self.coordinator.api.set_heating_circuit_device_status(
+                self.system.system_status.device_id,
+                self.coordinator.system_id,
+                self._hc_id,
+                True,
+            )
+        await self.coordinator.async_request_refresh()
 
-    @property
-    def hvac_modes(self) -> list[HVACMode]:
-        """Return the list of available HVAC operation modes."""
-        return SUPPORTED_HVAC_MODES
-
-    @property
-    def hvac_mode(self) -> HVACMode:
-        """
-        Return currently selected HVAC operation mode.
-        If Heating_Enable is not available, return the last known value.
-        """
-        try:
-            enable = self._get_cached_value("Heating_Enable",HVACMode.OFF)
-            if enable == 1:
-                self._cache["hvac_mode"] = HVACMode.HEAT
-            else:
-                self._cache["hvac_mode"] = HVACMode.OFF
-        except (AttributeError, KeyError):
-            pass  # 如果获取失败，保持上一次的值
-
-        return self._cache.get("hvac_mode", HVACMode.OFF)
-
-    @property
-    def hvac_action(self) -> HVACAction:
-        """
-        Return the currently running HVAC action.
-        If Heating_Enable is not available, return the last known value.
-        """
-        try:
-            enable = self._get_cached_value("Heating_Enable",False)
-            _LOGGER.debug("enable===%s",enable)
-            if enable == 0:
-                self._cache["hvac_action"] = HVACAction.OFF
-            elif enable == 1:
-                self._cache["hvac_action"] = HVACAction.HEATING
-            else:
-                self._cache["hvac_action"] = HVACAction.IDLE
-        except (AttributeError, KeyError):
-            pass  # 如果获取失败，保持上一次的值
-
-        return self._cache.get("hvac_action", HVACAction.IDLE)
-    
-
-    @property
-    def preset_modes(self) -> list[str]:
-        """Return the list of available HVAC preset modes."""
-
-        return SUPPORTED_PRESET_MODES
-
-    @property
-    def preset_mode(self) -> str:
-        """Return the currently selected HVAC preset mode."""
-
-        return None
-
-
-    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Select new HVAC operation mode."""
-
-        _LOGGER.debug("Setting HVAC mode to: %s", hvac_mode)
-
-        try:
-            if hvac_mode == HVACMode.OFF:
-                await self._client.control_device({"Heating_Enable": False})
-                self.set_device_attr("Heating_Enable", False)
-                self._cache["hvac_mode"] = HVACMode.OFF
-                self._cache["hvac_action"] = HVACAction.OFF
-            elif hvac_mode == HVACMode.HEAT:
-                await self._client.control_device({"Heating_Enable": True})
-                self.set_device_attr("Heating_Enable", True)
-                self._cache["hvac_mode"] = HVACMode.HEAT
-                self._cache["hvac_action"] = HVACAction.HEATING
-        except Exception as e:
-            _LOGGER.error("Failed to set HVAC mode: %s", e)
-
-    async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Select new HVAC preset mode."""
-
-        _LOGGER.debug("Setting HVAC preset mode to: %s", preset_mode)
-        return None
-    
-
-    async def async_set_temperature(self, **kwargs) -> None:
-        """Update target room temperature value."""
-
-        new_temperature = kwargs.get(ATTR_TEMPERATURE)
-        if new_temperature is None:
-            return
-
-        _LOGGER.debug("Setting target temperature to: %s", new_temperature)
-
-        await self._client.control_device({
-            "Flow_Temperature_Setpoint": new_temperature,
-        })
-       
-        self._cache["Flow_Temperature_Setpoint"] = new_temperature
-        self.set_device_attr("Flow_Temperature_Setpoint", new_temperature)
-
-    async def async_turn_off(self):
-        """
-        Turn off the climate device.
-        This method sets `Heating_Enable` to False and updates the cached values.
-        """
-        try:
-            # 关闭设备
-            await self._client.control_device({"Heating_Enable": False})
-            self.set_device_attr("Heating_Enable", False)
-
-            # 更新缓存
-            self._cache["hvac_mode"] = HVACMode.OFF
-            self._cache["hvac_action"] = HVACAction.OFF
-        except Exception as e:
-            _LOGGER.error("Failed to turn off the device: %s", e)
- 
-    @property
-    def min_temp(self) -> float | None:
-        """Return the minimum temperature."""
-        return self._get_cached_value("Lower_Limitation_of_CH_Setpoint", default=30.0)
-
-    @property
-    def max_temp(self) -> float | None:
-        """Return the maximum temperature."""
-        return self._get_cached_value("Upper_Limitation_of_CH_Setpoint", default=75.0)
-    
-
-    @property
-    def target_temperature_high(self) -> float | None:
-        """Return the highbound target temperature we try to reach."""
-        return self._get_cached_value("Upper_Limitation_of_CH_Setpoint", default=75.0)
-
-    @property
-    def target_temperature_low(self) -> float | None:
-        """Return the lowbound target temperature we try to reach."""
-        return self._get_cached_value("Lower_Limitation_of_CH_Setpoint", default=30.0)
-    
-    def _get_cached_value(self, attr_name: str, default: float) -> float:
-        """
-        Get a cached value for a device attribute.
-        If the value is not available, return the last known value or a default value.
-        """
-        try:
-            value = self.get_device_attr(attr_name)
-            if value is not None:
-                self._cache[attr_name] = value  # 更新缓存
-        except (AttributeError, KeyError) as e:
-            _LOGGER.debug("Failed to get device attribute %s: %s", attr_name, e)
-            value = None  # 如果获取失败，保持上一次的值
-
-        # 如果当前值为 None 且缓存值不为 None，则返回缓存值
-        if value is None and attr_name in self._cache:
-            return self._cache[attr_name]
-
-        # 如果当前值和缓存值都为 None，则返回默认值
-        return value if value is not None else default
+    async def async_set_preset_mode(self, preset_mode):
+        """Set new target preset mode."""
+        mode = "comfort" if preset_mode == PRESET_COMFORT else "eco" if preset_mode == PRESET_ECO else "normal"
+        await self.coordinator.api.set_heating_circuit_operating_mode(
+            self.system.system_status.device_id,
+            self.coordinator.system_id,
+            self._hc_id,
+            mode,
+        )
+        await self.coordinator.async_request_refresh()
